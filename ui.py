@@ -3,13 +3,13 @@ import sys
 import shutil
 import tempfile
 from pathlib import Path
-from func import clone_audio
+
 from PySide6.QtCore import Qt, QUrl, QThread, Signal, QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication, QFrame, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
-    QSlider, QVBoxLayout, QWidget
+    QSlider, QVBoxLayout, QWidget, QCheckBox
 )
 from PySide6.QtMultimedia import (
     QAudioOutput, QMediaPlayer, QMediaCaptureSession,
@@ -114,6 +114,23 @@ QSlider::add-page:horizontal { background: #dce5f3; border-radius: 3px; }
 QSlider::handle:horizontal {
     width: 15px; margin: -6px 0; border-radius: 8px;
     background: #3976e8; border: 3px solid white;
+}
+QCheckBox {
+    font-size: 13px;
+    font-weight: 600;
+    color: #35435a;
+    spacing: 8px;
+}
+QCheckBox::indicator {
+    width: 18px;
+    height: 18px;
+    border-radius: 4px;
+    border: 1px solid #cbd5e1;
+    background: #ffffff;
+}
+QCheckBox::indicator:checked {
+    background: #3976e8;
+    border-color: #3976e8;
 }
 """
 
@@ -242,6 +259,46 @@ class CloneWorker(QThread):
             self.failed.emit(f"{type(error).__name__}: {error}")
 
 
+class ManipulateWorker(QThread):
+    """Run DSP audio manipulation in a background thread."""
+
+    finished_successfully = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, input_path, output_path, pitch_steps, volume_db, speed_rate, reverse):
+        super().__init__()
+
+        self.input_path = input_path
+        self.output_path = output_path
+        self.pitch_steps = pitch_steps
+        self.volume_db = volume_db
+        self.speed_rate = speed_rate
+        self.reverse = reverse
+
+    def run(self):
+        try:
+            from manipulate_audio import alter_voice
+
+            out_path = alter_voice(
+                input_path=self.input_path,
+                output_path=self.output_path,
+                pitch_steps=self.pitch_steps,
+                volume_boost_db=self.volume_db,
+                speed_rate=self.speed_rate,
+                reverse=self.reverse,
+            )
+
+            if not out_path or not os.path.isfile(out_path):
+                raise FileNotFoundError(
+                    f"The altered audio file was not found:\n{out_path}"
+                )
+
+            self.finished_successfully.emit(out_path)
+
+        except Exception as error:
+            self.failed.emit(f"{type(error).__name__}: {error}")
+
+
 class AudioCard(QFrame):
     def __init__(self, title, kind="reference"):
         super().__init__()
@@ -252,6 +309,7 @@ class AudioCard(QFrame):
         self.kind = kind
         self.selected_file_path = ""
         self.generated_file_path = ""
+        self.altered_file_path = ""
 
         self.audio_output = QAudioOutput(self)
         self.audio_player = QMediaPlayer(self)
@@ -268,21 +326,21 @@ class AudioCard(QFrame):
         self.capture_session = QMediaCaptureSession(self)
         self.audio_input = QAudioInput(self)
         self.capture_session.setAudioInput(self.audio_input)
-        
+
         self.recorder = QMediaRecorder(self)
-        
+
         # Enforce valid WAV file encoding
         media_format = QMediaFormat()
         media_format.setFileFormat(QMediaFormat.FileFormat.Wave)
         media_format.setAudioCodec(QMediaFormat.AudioCodec.Wave)
-        
+
         self.recorder.setMediaFormat(media_format)
         self.recorder.setAudioSampleRate(44100)
         self.recorder.setAudioChannelCount(1)
         self.recorder.setQuality(QMediaRecorder.Quality.HighQuality)
-        
+
         self.capture_session.setRecorder(self.recorder)
-        
+
         # Set a temporary file path for the active recording
         self.temp_record_path = os.path.join(tempfile.gettempdir(), f"temp_record_{id(self)}.wav")
         self.recorder.setOutputLocation(QUrl.fromLocalFile(self.temp_record_path))
@@ -291,7 +349,7 @@ class AudioCard(QFrame):
         self.record_timer = QTimer(self)
         self.record_timer.timeout.connect(self.animate_recording)
         self.wave_pattern = [
-            "▂", "▄", "▆", "▃", "▅", "▂", "▇", "▄", "▂", "▅", 
+            "▂", "▄", "▆", "▃", "▅", "▂", "▇", "▄", "▂", "▅",
             "▃", "▆", "▂", "▄", "▅", "▃", "▇", "▂", "▅", "▄", "▃", "▆"
         ]
 
@@ -301,6 +359,8 @@ class AudioCard(QFrame):
         )
 
         self.clone_worker = None
+        self.manipulate_worker = None
+
         self.loading_frame_index = 0
         self.loading_frames = ["◐", "◓", "◑", "◒"]
 
@@ -400,16 +460,6 @@ class AudioCard(QFrame):
 
         outer.addWidget(self.selected_row("Selected file:"))
 
-        outer.addWidget(
-            self.subsection(
-                "Noise Filtered",
-                "Processed audio output",
-                "Filtered audio:",
-                "Not generated",
-                "Filter",
-            )
-        )
-
         outer.addWidget(self.pitch_volume_section())
 
     def field_label(self, text):
@@ -450,7 +500,7 @@ class AudioCard(QFrame):
         row.addWidget(wave, 1)
 
         return row
-    
+
     def animate_recording(self):
         # Shift the character array by 1 to create an animation
         self.wave_pattern = self.wave_pattern[1:] + [self.wave_pattern[0]]
@@ -460,11 +510,11 @@ class AudioCard(QFrame):
         self.status.setText("Recording audio...")
         self.record_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        
+
         # Start soundwave animation (red)
-        self.wave_bars.setStyleSheet("color:#dc4e5a; font-size:14px;") 
+        self.wave_bars.setStyleSheet("color:#dc4e5a; font-size:14px;")
         self.record_timer.start(100) # update every 100ms
-        
+
         self.recorder.record()
 
     def stop_recording(self):
@@ -475,13 +525,17 @@ class AudioCard(QFrame):
 
         # Stop soundwave animation (grey out)
         self.record_timer.stop()
-        self.wave_bars.setStyleSheet("color:#cbd5e1; font-size:14px;") 
+        self.wave_bars.setStyleSheet("color:#cbd5e1; font-size:14px;")
 
-        # Ask the user where to save the file
+        # Ensure original directory exists in the project root
+        original_dir = Path(__file__).resolve().parent / "original"
+        original_dir.mkdir(parents=True, exist_ok=True)
+
+        # Ask the user where to save the file, defaulting to the 'original' folder
         save_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Recorded Audio",
-            str(Path.home() / "recorded_voice.wav"),
+            str(original_dir / "recorded_voice.wav"),
             "Audio Files (*.wav);;All files (*)"
         )
 
@@ -490,13 +544,13 @@ class AudioCard(QFrame):
                 # Copy from the temporary location to the chosen destination
                 shutil.copy(self.temp_record_path, save_path)
                 self.status.setText(f"Recording saved to: {Path(save_path).name}")
-                
+
                 # Automatically select the new recording in the UI
-                self.set_selected_file(save_path) 
+                self.set_selected_file(save_path)
             except Exception as e:
                 QMessageBox.critical(
-                    self, 
-                    "Save Failed", 
+                    self,
+                    "Save Failed",
                     f"Failed to save recording:\n{e}"
                 )
         else:
@@ -514,7 +568,7 @@ class AudioCard(QFrame):
         info.setSpacing(4)
 
         default_text = "No file generated" if generated else "No file selected"
-        
+
         file_label = self.field_label(f"{label_text} {default_text}")
         file_label.setStyleSheet(
             "font-size:12px; color:#64748b; font-weight:600;"
@@ -563,55 +617,6 @@ class AudioCard(QFrame):
 
         return panel
 
-    def subsection(self, title, subtitle, label, filename, action):
-        section = QFrame()
-        section.setStyleSheet(
-            "QFrame { border: none; border-top: 1px solid #e9edf5; }"
-        )
-
-        layout = QVBoxLayout(section)
-        layout.setContentsMargins(0, 18, 0, 0)
-        layout.setSpacing(12)
-
-        heading = QVBoxLayout()
-
-        title_label = QLabel(title)
-        title_label.setStyleSheet(
-            "font-size:16px; font-weight:750; color:#1e293b;"
-        )
-
-        sub_label = QLabel(subtitle)
-        sub_label.setObjectName("muted")
-
-        heading.addWidget(title_label)
-        heading.addWidget(sub_label)
-        layout.addLayout(heading)
-
-        panel = QFrame()
-        panel.setObjectName("softPanel")
-
-        row = QHBoxLayout(panel)
-        row.setContentsMargins(13, 10, 13, 10)
-
-        row.addWidget(QLabel(label))
-
-        file = QLabel(filename)
-        file.setObjectName("muted")
-        row.addWidget(file, 1)
-
-        play = QPushButton("Play")
-        play.setObjectName("secondary")
-        play.setEnabled(False)
-        row.addWidget(play)
-
-        layout.addWidget(panel)
-
-        button = QPushButton(action)
-        button.setEnabled(False)
-        layout.addWidget(button)
-
-        return section
-
     def pitch_volume_section(self):
         section = QFrame()
         section.setStyleSheet(
@@ -622,12 +627,12 @@ class AudioCard(QFrame):
         layout.setContentsMargins(0, 20, 0, 0)
         layout.setSpacing(14)
 
-        title = QLabel("Pitch and Volume Alter")
+        title = QLabel("Pitch, Volume & Speed Alteration")
         title.setStyleSheet(
             "font-size:16px; font-weight:750; color:#1e293b;"
         )
 
-        subtitle = QLabel("Adjust the audio before generating the output")
+        subtitle = QLabel("Adjust parameters and generate the altered audio output")
         subtitle.setObjectName("muted")
 
         layout.addWidget(title)
@@ -641,34 +646,66 @@ class AudioCard(QFrame):
         grid.setContentsMargins(18, 16, 18, 16)
         grid.setSpacing(17)
 
-        self.pitch_value = QLabel("1.00×")
+        # 1. Pitch Control (-12 ST to +12 ST)
+        self.pitch_value = QLabel("0 ST")
+        self.pitch_slider = QSlider(Qt.Orientation.Horizontal)
+        self.pitch_slider.setRange(-12, 12)
+        self.pitch_slider.setValue(0)
+        self.pitch_slider.valueChanged.connect(
+            lambda v: self.pitch_value.setText(f"{'+' if v > 0 else ''}{v} ST")
+        )
         grid.addLayout(
-            self.slider_control(
-                "Pitch", "Lower", "Normal", "Higher",
-                50, 200, 100, self.pitch_value
+            self.make_slider_box(
+                "Pitch (Semitones)", "-12 ST", "0 ST", "+12 ST",
+                self.pitch_slider, self.pitch_value
             )
         )
 
-        self.volume_value = QLabel("+100%")
+        # 2. Volume Boost (-20 dB to +20 dB)
+        self.volume_value = QLabel("0 dB")
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setRange(-20, 20)
+        self.volume_slider.setValue(0)
+        self.volume_slider.valueChanged.connect(
+            lambda v: self.volume_value.setText(f"{'+' if v > 0 else ''}{v} dB")
+        )
         grid.addLayout(
-            self.slider_control(
-                "Volume Boost", "Original", "+100%", "+200%",
-                0, 200, 100, self.volume_value
+            self.make_slider_box(
+                "Volume Boost (dB)", "-20 dB", "0 dB", "+20 dB",
+                self.volume_slider, self.volume_value
             )
         )
 
-        generate = QPushButton("Generate")
-        generate.setEnabled(False)
-        grid.addWidget(generate)
+        # 3. Speed Control (0.50x to 2.00x)
+        self.speed_value = QLabel("1.00×")
+        self.speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.speed_slider.setRange(50, 200)
+        self.speed_slider.setValue(100)
+        self.speed_slider.valueChanged.connect(
+            lambda v: self.speed_value.setText(f"{v / 100:.2f}×")
+        )
+        grid.addLayout(
+            self.make_slider_box(
+                "Playback Speed", "0.50×", "1.00×", "2.00×",
+                self.speed_slider, self.speed_value
+            )
+        )
+
+        # 4. Reverse Checkbox
+        self.reverse_checkbox = QCheckBox("Reverse Audio Playback")
+        grid.addWidget(self.reverse_checkbox)
+
+        # Generate Button
+        self.generate_altered_btn = QPushButton("Generate")
+        self.generate_altered_btn.setEnabled(False)
+        self.generate_altered_btn.clicked.connect(self.start_voice_alteration)
+        grid.addWidget(self.generate_altered_btn)
 
         layout.addWidget(controls)
 
         return section
 
-    def slider_control(
-        self, title, left, middle, right,
-        minimum, maximum, value, value_label
-    ):
+    def make_slider_box(self, title, left, middle, right, slider, value_label):
         wrapper = QVBoxLayout()
 
         heading = QHBoxLayout()
@@ -686,19 +723,6 @@ class AudioCard(QFrame):
         heading.addStretch()
         heading.addWidget(value_label)
         wrapper.addLayout(heading)
-
-        slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setRange(minimum, maximum)
-        slider.setValue(value)
-
-        if title == "Pitch":
-            slider.valueChanged.connect(
-                lambda v: value_label.setText(f"{v / 100:.2f}×")
-            )
-        else:
-            slider.valueChanged.connect(
-                lambda v: value_label.setText(f"+{v}%")
-            )
 
         wrapper.addWidget(slider)
 
@@ -719,17 +743,40 @@ class AudioCard(QFrame):
 
         row = QHBoxLayout(panel)
         row.setContentsMargins(13, 10, 13, 10)
+        row.setSpacing(12)
 
-        row.addWidget(QLabel("Altered audio:"))
+        info = QVBoxLayout()
+        info.setSpacing(4)
 
-        label = QLabel("No output generated")
-        label.setObjectName("muted")
-        row.addWidget(label, 1)
+        self.altered_file_label = self.field_label("Altered audio: No output generated")
+        self.altered_file_label.setStyleSheet(
+            "font-size:12px; color:#64748b; font-weight:600;"
+        )
+        self.altered_file_label.setWordWrap(True)
+        self.altered_file_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.altered_file_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.altered_file_label.setMinimumWidth(0)
 
-        play = QPushButton("Play")
-        play.setObjectName("secondary")
-        play.setEnabled(False)
-        row.addWidget(play)
+        info.addWidget(self.altered_file_label)
+        row.addLayout(info, 1)
+
+        self.altered_play_button = QPushButton("Play")
+        self.altered_play_button.setObjectName("secondary")
+        self.altered_play_button.setMinimumWidth(76)
+        self.altered_play_button.setEnabled(False)
+        self.altered_play_button.clicked.connect(
+            lambda: self.toggle_playback(
+                self.altered_file_path,
+                self.altered_play_button,
+            )
+        )
+
+        row.addWidget(self.altered_play_button)
 
         return panel
 
@@ -778,6 +825,9 @@ class AudioCard(QFrame):
 
         if self.kind == "reference":
             self.validate_clone_fields()
+        elif self.kind == "manipulator":
+            if hasattr(self, "generate_altered_btn"):
+                self.generate_altered_btn.setEnabled(True)
 
     def validate_clone_fields(self):
         if self.kind != "reference":
@@ -840,6 +890,61 @@ class AudioCard(QFrame):
 
         self.clone_worker.start()
 
+    def start_voice_alteration(self):
+        if self.kind != "manipulator":
+            return
+
+        if not self.selected_file_path or not os.path.isfile(self.selected_file_path):
+            QMessageBox.warning(
+                self,
+                "No Audio Selected",
+                "Please upload or record an audio file first.",
+            )
+            return
+
+        if (
+            self.manipulate_worker is not None
+            and self.manipulate_worker.isRunning()
+        ):
+            return
+
+        self.generate_altered_btn.setEnabled(False)
+        self.generate_altered_btn.setText("Generating...")
+
+        self.loading_label.show()
+        self.loading_frame_index = 0
+        self.loading_label.setText("◐ Generating...")
+        self.loading_timer.start(120)
+
+        self.status.setText("Processing audio modifications. Please wait...")
+
+        output_dir = Path(__file__).resolve().parent / "altered"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        input_stem = Path(self.selected_file_path).stem
+        dest_output_path = str(output_dir / f"{input_stem}_altered.wav")
+
+        pitch_steps = float(self.pitch_slider.value())
+        volume_db = float(self.volume_slider.value())
+        speed_rate = float(self.speed_slider.value()) / 100.0
+        reverse = self.reverse_checkbox.isChecked()
+
+        self.manipulate_worker = ManipulateWorker(
+            input_path=self.selected_file_path,
+            output_path=dest_output_path,
+            pitch_steps=pitch_steps,
+            volume_db=volume_db,
+            speed_rate=speed_rate,
+            reverse=reverse,
+        )
+
+        self.manipulate_worker.finished_successfully.connect(
+            self.manipulate_succeeded
+        )
+        self.manipulate_worker.failed.connect(self.manipulate_failed)
+        self.manipulate_worker.finished.connect(self.cleanup_manipulate_worker)
+
+        self.manipulate_worker.start()
+
     def animate_loading(self):
         self.loading_frame_index = (
             self.loading_frame_index + 1
@@ -855,7 +960,6 @@ class AudioCard(QFrame):
         self.generated_file_path = os.path.abspath(output_path)
         filename = Path(self.generated_file_path).name
 
-        # Update the path label to mirror the Selected file formatting
         self.generated_file_label.setText(
             f"Generated clone: {filename}\n{self.generated_file_path}"
         )
@@ -888,6 +992,43 @@ class AudioCard(QFrame):
 
         self.validate_clone_fields()
 
+    def manipulate_succeeded(self, output_path):
+        self.loading_timer.stop()
+        self.loading_label.hide()
+
+        self.altered_file_path = os.path.abspath(output_path)
+        filename = Path(self.altered_file_path).name
+
+        self.altered_file_label.setText(
+            f"Altered audio: {filename}\n{self.altered_file_path}"
+        )
+        self.altered_file_label.setToolTip(
+            self.altered_file_path
+        )
+
+        self.altered_play_button.setEnabled(
+            os.path.isfile(self.altered_file_path)
+        )
+        self.altered_play_button.setText("Play")
+
+        self.generate_altered_btn.setText("Generate")
+        self.generate_altered_btn.setEnabled(True)
+        self.status.setText("Audio altered successfully.")
+
+    def manipulate_failed(self, error_message):
+        self.loading_timer.stop()
+        self.loading_label.hide()
+
+        self.generate_altered_btn.setText("Generate")
+        self.generate_altered_btn.setEnabled(True)
+        self.status.setText("Audio alteration failed.")
+
+        QMessageBox.critical(
+            self,
+            "Audio Alteration Failed",
+            error_message,
+        )
+
     def cleanup_worker(self):
         worker = self.clone_worker
         self.clone_worker = None
@@ -897,6 +1038,17 @@ class AudioCard(QFrame):
 
         if self.kind == "reference":
             self.validate_clone_fields()
+
+    def cleanup_manipulate_worker(self):
+        worker = self.manipulate_worker
+        self.manipulate_worker = None
+
+        if worker is not None:
+            worker.deleteLater()
+
+        if self.kind == "manipulator" and hasattr(self, "generate_altered_btn"):
+            if self.selected_file_path and os.path.isfile(self.selected_file_path):
+                self.generate_altered_btn.setEnabled(True)
 
     def toggle_playback(self, file_path=None, button=None):
         if not file_path or not os.path.isfile(file_path):
@@ -934,6 +1086,10 @@ class AudioCard(QFrame):
             self.status.setText(
                 f"Playing generated clone: {Path(file_path).name}"
             )
+        elif file_path == self.altered_file_path:
+            self.status.setText(
+                f"Playing altered audio: {Path(file_path).name}"
+            )
         else:
             self.status.setText(f"Playing: {Path(file_path).name}")
 
@@ -945,6 +1101,12 @@ class AudioCard(QFrame):
                 == self.generated_file_path
             ):
                 self.generated_play_button.setText("Pause")
+            elif (
+                self.altered_file_path
+                and self.audio_player.source().toLocalFile()
+                == self.altered_file_path
+            ):
+                self.altered_play_button.setText("Pause")
             elif hasattr(self, "play_button"):
                 self.play_button.setText("Pause")
 
@@ -955,6 +1117,12 @@ class AudioCard(QFrame):
                 == self.generated_file_path
             ):
                 self.generated_play_button.setText("Resume")
+            elif (
+                self.altered_file_path
+                and self.audio_player.source().toLocalFile()
+                == self.altered_file_path
+            ):
+                self.altered_play_button.setText("Resume")
             elif hasattr(self, "play_button"):
                 self.play_button.setText("Resume")
 
@@ -965,6 +1133,9 @@ class AudioCard(QFrame):
             if hasattr(self, "generated_play_button"):
                 self.generated_play_button.setText("Play")
 
+            if hasattr(self, "altered_play_button"):
+                self.altered_play_button.setText("Play")
+
     def handle_playback_error(self, error, error_string):
         if error != QMediaPlayer.Error.NoError:
             self.status.setText(f"Playback error: {error_string}")
@@ -974,6 +1145,9 @@ class AudioCard(QFrame):
 
             if hasattr(self, "generated_play_button"):
                 self.generated_play_button.setText("Play")
+
+            if hasattr(self, "altered_play_button"):
+                self.altered_play_button.setText("Play")
 
 
 class MainWindow(QMainWindow):
