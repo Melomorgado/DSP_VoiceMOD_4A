@@ -53,7 +53,7 @@ After activation, your terminal prompt should indicate that `.venv` is active.
 With the virtual environment activated, run:
 
 ```bash
-python -m pip install -r reqs.txt
+pip install -r reqs.txt
 ```
 
 ### 6. Launch the application
