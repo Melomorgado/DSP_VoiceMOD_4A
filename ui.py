@@ -1,9 +1,9 @@
 import os
 import sys
-import shutil
 import tempfile
+import wave
 from pathlib import Path
-
+from func import clone_audio
 from PySide6.QtCore import Qt, QUrl, QThread, Signal, QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
@@ -15,6 +15,78 @@ from PySide6.QtMultimedia import (
     QAudioOutput, QMediaPlayer, QMediaCaptureSession,
     QAudioInput, QMediaRecorder, QMediaFormat
 )
+
+
+def amplify_wav(input_path, output_path, gain=10.0):
+    """Boost PCM WAV amplitude by 3.42x (80% then a further 90%), while preventing clipping."""
+    def iter_samples(data, sample_width):
+        if sample_width == 1:
+            # 8-bit PCM WAV samples are unsigned and centered at 128.
+            for value in data:
+                yield value - 128
+        else:
+            for offset in range(0, len(data), sample_width):
+                yield int.from_bytes(
+                    data[offset:offset + sample_width],
+                    byteorder="little",
+                    signed=True,
+                )
+
+    with wave.open(str(input_path), "rb") as source:
+        if source.getcomptype() != "NONE":
+            raise ValueError("The recording is not an uncompressed PCM WAV file.")
+
+        channels = source.getnchannels()
+        sample_width = source.getsampwidth()
+        sample_rate = source.getframerate()
+
+        if sample_width not in (1, 2, 3, 4):
+            raise ValueError(f"Unsupported WAV sample width: {sample_width * 8}-bit.")
+
+        # Check the peak first so the boost can be reduced when necessary to
+        # preserve audio quality instead of clipping loud samples.
+        peak = 0
+        while True:
+            chunk = source.readframes(65536)
+            if not chunk:
+                break
+            for sample in iter_samples(chunk, sample_width):
+                peak = max(peak, abs(sample))
+
+    if peak == 0:
+        effective_gain = gain
+    else:
+        max_peak = (1 << (sample_width * 8 - 1)) - 1
+        effective_gain = min(gain, max_peak / peak)
+
+    lower_limit = -(1 << (sample_width * 8 - 1))
+    upper_limit = (1 << (sample_width * 8 - 1)) - 1
+
+    with wave.open(str(input_path), "rb") as source, wave.open(str(output_path), "wb") as destination:
+        destination.setnchannels(channels)
+        destination.setsampwidth(sample_width)
+        destination.setframerate(sample_rate)
+        destination.setcomptype("NONE", "not compressed")
+
+        while True:
+            chunk = source.readframes(65536)
+            if not chunk:
+                break
+
+            boosted = bytearray()
+            for sample in iter_samples(chunk, sample_width):
+                sample = round(sample * effective_gain)
+                sample = max(lower_limit, min(upper_limit, sample))
+
+                if sample_width == 1:
+                    boosted.append(sample + 128)
+                else:
+                    boosted.extend(
+                        sample.to_bytes(sample_width, byteorder="little", signed=True)
+                    )
+
+            destination.writeframesraw(boosted)
+
 
 APP_STYLE = """
 QMainWindow, QWidget#centralWidget {
@@ -340,6 +412,8 @@ class AudioCard(QFrame):
         self.recorder.setQuality(QMediaRecorder.Quality.HighQuality)
 
         self.capture_session.setRecorder(self.recorder)
+        self._save_after_recording_stops = False
+        self.recorder.recorderStateChanged.connect(self._on_recorder_state_changed)
 
         # Set a temporary file path for the active recording
         self.temp_record_path = os.path.join(tempfile.gettempdir(), f"temp_record_{id(self)}.wav")
@@ -507,54 +581,98 @@ class AudioCard(QFrame):
         self.wave_bars.setText(" ".join(self.wave_pattern))
 
     def start_recording(self):
+        # Remove the previous take so a new recording cannot accidentally reuse it.
+        try:
+            Path(self.temp_record_path).unlink(missing_ok=True)
+        except OSError as error:
+            QMessageBox.warning(
+                self,
+                "Recording Setup Failed",
+                f"Could not prepare the temporary recording file:\n{error}",
+            )
+            return
+
+        self._save_after_recording_stops = False
         self.status.setText("Recording audio...")
         self.record_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
 
         # Start soundwave animation (red)
         self.wave_bars.setStyleSheet("color:#dc4e5a; font-size:14px;")
-        self.record_timer.start(100) # update every 100ms
-
+        self.record_timer.start(100)
         self.recorder.record()
 
     def stop_recording(self):
+        if self.recorder.recorderState() == QMediaRecorder.RecorderState.StoppedState:
+            return
+
+        # QMediaRecorder finalizes the WAV asynchronously after stop() is called.
+        self._save_after_recording_stops = True
+        self.status.setText("Finalizing recording...")
+        self.stop_btn.setEnabled(False)
+
+        self.record_timer.stop()
+        self.wave_bars.setStyleSheet("color:#cbd5e1; font-size:14px;")
         self.recorder.stop()
-        self.status.setText("Recording stopped. Choose where to save...")
+
+        # If the recorder was already stopped by the time stop() returned,
+        # schedule the save dialog ourselves as a fallback.
+        if self.recorder.recorderState() == QMediaRecorder.RecorderState.StoppedState:
+            QTimer.singleShot(0, self._finish_recording_save)
+
+    def _on_recorder_state_changed(self, state):
+        if (
+            state == QMediaRecorder.RecorderState.StoppedState
+            and self._save_after_recording_stops
+        ):
+            QTimer.singleShot(0, self._finish_recording_save)
+
+    def _finish_recording_save(self):
+        if not self._save_after_recording_stops:
+            return
+
+        self._save_after_recording_stops = False
         self.record_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
 
-        # Stop soundwave animation (grey out)
-        self.record_timer.stop()
-        self.wave_bars.setStyleSheet("color:#cbd5e1; font-size:14px;")
+        if not os.path.isfile(self.temp_record_path) or os.path.getsize(self.temp_record_path) <= 44:
+            self.status.setText("Recording failed or produced no audio.")
+            QMessageBox.warning(
+                self,
+                "Recording Unavailable",
+                "No usable audio was recorded. Please check your microphone and try again.",
+            )
+            return
 
-        # Ensure original directory exists in the project root
         original_dir = Path(__file__).resolve().parent / "original"
         original_dir.mkdir(parents=True, exist_ok=True)
 
-        # Ask the user where to save the file, defaulting to the 'original' folder
         save_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Recorded Audio",
             str(original_dir / "recorded_voice.wav"),
-            "Audio Files (*.wav);;All files (*)"
+            "Audio Files (*.wav);;All files (*)",
         )
 
-        if save_path:
-            try:
-                # Copy from the temporary location to the chosen destination
-                shutil.copy(self.temp_record_path, save_path)
-                self.status.setText(f"Recording saved to: {Path(save_path).name}")
-
-                # Automatically select the new recording in the UI
-                self.set_selected_file(save_path)
-            except Exception as e:
-                QMessageBox.critical(
-                    self,
-                    "Save Failed",
-                    f"Failed to save recording:\n{e}"
-                )
-        else:
+        if not save_path:
             self.status.setText("Recording discarded.")
+            return
+
+        try:
+            # Apply the original 80% boost, then a further 90% boost: 1.8 * 1.9 = 3.42x
+            # (+ approximately 10.7 dB versus the original). Reduce gain as needed to avoid clipping.
+            amplify_wav(self.temp_record_path, save_path, gain=3.42)
+            self.status.setText(
+                f"Recording saved with volume boost: {Path(save_path).name}"
+            )
+            self.set_selected_file(save_path)
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Save Failed",
+                f"Could not boost and save the recording:\n{error}",
+            )
+            self.status.setText("Recording could not be saved.")
 
     def selected_row(self, label_text, generated=False):
         panel = QFrame()
